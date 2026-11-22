@@ -1,0 +1,48 @@
+# Local infrastructure for MediScribe.
+# Start:  docker compose up -d      Stop: docker compose down
+services:
+
+  # Mock hospital EHR system that speaks FHIR (the healthcare data standard).
+  # Uses an in-memory database: data resets when the container restarts,
+  # so scripts/load_synthea.py re-loads the sample patients.
+  fhir:
+    image: hapiproject/hapi:latest
+    container_name: mediscribe-fhir
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  # Our app's own database: encounters, approved notes, audit log, analytics.
+  # Also stores LangGraph checkpoints.
+  postgres:
+    image: postgres:16
+    container_name: mediscribe-postgres
+    environment:
+      POSTGRES_USER: mediscribe
+      POSTGRES_PASSWORD: mediscribe
+      POSTGRES_DB: mediscribe
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Graph database for GraphRAG: symptoms -> diseases -> drugs.
+  neo4j:
+    image: neo4j:5-community
+    container_name: mediscribe-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/mediscribe123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports:
+      - "7474:7474"   # browser UI: http://localhost:7474
+      - "7687:7687"   # bolt (used by Python)
+    volumes:
+      - neo4jdata:/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  neo4jdata:

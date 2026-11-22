@@ -1,0 +1,33 @@
+# Config & data models
+python-dotenv>=1.0
+pydantic>=2.7
+pydantic-settings>=2.3
+
+# LLM SDKs
+google-genai>=1.0
+anthropic>=0.40
+
+# Monitoring
+langfuse>=3.0
+
+# Data
+datasets>=3.0
+pandas>=2.2
+requests>=2.32
+
+# Databases
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+neo4j>=5.20
+
+# Speech-to-text (runs locally on CPU) + demo audio generation + accuracy metric
+faster-whisper>=1.1
+edge-tts>=7.0
+jiwer>=3.0
+
+# Retries for free-tier rate limits
+tenacity>=8.5
+
+# Dev
+pytest>=8.0
+rich>=13.7
