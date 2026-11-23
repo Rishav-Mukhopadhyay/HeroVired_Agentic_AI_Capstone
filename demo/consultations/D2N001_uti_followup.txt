@@ -1,0 +1,27 @@
+[doctor] Hi Martha, good to see you again. What brings you in today?
+[patient] Hi doctor. For the last two days it burns when I pee, and I feel like I have to go all the time, even at night.
+[doctor] I'm sorry to hear that. Any blood in your urine that you've noticed?
+[patient] No, I don't think so. It just looks a bit cloudy.
+[doctor] Any fever, chills, or pain in your back or your sides?
+[patient] No fever. No back pain. Just some pressure low down in my belly.
+[doctor] Any nausea or vomiting?
+[patient] No.
+[doctor] Have you had anything like this before?
+[patient] Maybe once, years ago.
+[doctor] Okay. And you're still taking your lisinopril, the furosemide and the sertraline?
+[patient] Yes, every day, same as before.
+[doctor] Good. How has your blood pressure been at home?
+[patient] Pretty good, around 130 over 80.
+[doctor] Great. Let me examine you. Your temperature today is 98.4, blood pressure 132 over 82, heart rate 78. Your belly is soft, a little tender just above the pubic bone, and there's no tenderness over your kidneys on either side.
+[patient] Okay.
+[doctor] The urine dipstick shows positive leukocyte esterase and positive nitrites, no blood.
+[patient] So it's an infection?
+[doctor] Yes, this looks like a simple bladder infection, what we call acute cystitis. There's nothing to suggest it has gone up to the kidneys.
+[patient] What do I need to do?
+[doctor] I'm going to start you on Bactrim DS, one tablet twice a day for three days. I'll also give you phenazopyridine 200 milligrams three times a day for two days to help with the burning. It will turn your urine orange, that's expected.
+[patient] Okay.
+[doctor] Drink plenty of fluids. I'll send the urine for culture, and if the culture shows the bacteria won't respond to the antibiotic, we'll call you and switch it.
+[patient] Alright.
+[doctor] If you develop a fever, back pain, or vomiting, or you're not better in two to three days, call us or come in right away.
+[patient] I will. Thank you, doctor.
+[doctor] You're welcome, Martha. Take care.

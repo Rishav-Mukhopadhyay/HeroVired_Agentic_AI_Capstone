@@ -9,8 +9,8 @@ Agent workflows use LangChain/LangGraph; this module serves simple utility calls
 
 from __future__ import annotations
 
+import threading
 import warnings
-from functools import lru_cache
 from typing import TypeVar
 
 from google import genai
@@ -29,21 +29,81 @@ warnings.filterwarnings("ignore", message=".*uses fixed sampling defaults.*")
 warnings.filterwarnings("ignore", message="coroutine 'ClientResponse.json' was never awaited")
 
 
-@lru_cache
+_client: genai.Client | None = None
+_client_lock = threading.Lock()
+
+
 def client() -> genai.Client:
-    return genai.Client(api_key=settings.gemini_api_key)
+    """One shared Gemini client for the whole process, created under a lock.
+
+    Agents run in parallel threads. Without the lock, two threads could each create a client;
+    the one not kept gets garbage-collected, and the SDK closes its HTTP connection while
+    the other thread is still using it ("Cannot send a request, as the client has been closed").
+    """
+    global _client
+    with _client_lock:
+        if _client is None:
+            # 60 s limit per request and no hidden SDK retries: our own retry/fallback logic decides
+            _client = genai.Client(
+                api_key=settings.gemini_api_key,
+                http_options=types.HttpOptions(timeout=60_000,
+                                               retry_options=types.HttpRetryOptions(attempts=1)))
+        return _client
 
 
 def _retryable(exc: BaseException) -> bool:
     return isinstance(exc, errors.APIError) and exc.code in (429, 500, 503)
 
 
-@retry(retry=retry_if_exception(_retryable), wait=wait_exponential(min=4, max=60),
-       stop=stop_after_attempt(6), reraise=True)
+def model_chain(model: str | None = None) -> list[str]:
+    """Main model first, then the configured fallbacks."""
+    fallbacks = [m.strip() for m in settings.gemini_fallback_models.split(",") if m.strip()]
+    first = model or settings.gemini_model
+    return [first] + [m for m in fallbacks if m != first]
+
+
+_usage = threading.local()  # which model answered the last call on this thread
+
+
+def last_model_used() -> str | None:
+    return getattr(_usage, "model", None)
+
+
 def generate_structured(prompt: str, schema: type[T], system: str | None = None,
                         model: str | None = None, temperature: float = 0.0) -> T:
-    resp = client().models.generate_content(
-        model=model or settings.gemini_model,
+    """Structured output with retries. If a model keeps failing, try the next Gemini model,
+    and finally Claude (a different provider) when CLAUDE_FALLBACK is on."""
+    last_exc: Exception | None = None
+    for name in model_chain(model):
+        try:
+            result = _generate_structured_once(prompt, schema, system, name, temperature)
+            _usage.model = name
+            return result
+        except errors.APIError as exc:  # overloaded / out of quota / retired model
+            last_exc = exc
+    if settings.claude_fallback and settings.anthropic_api_key:
+        try:
+            result = _claude_structured(prompt, schema, system)
+            _usage.model = settings.claude_model
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    raise last_exc  # type: ignore[misc]
+
+
+def _claude_structured(prompt: str, schema: type[T], system: str | None) -> T:
+    llm = chat_model("claude").with_structured_output(schema)
+    messages = ([("system", system)] if system else []) + [("user", prompt)]
+    return llm.invoke(messages)
+
+
+@retry(retry=retry_if_exception(_retryable), wait=wait_exponential(min=4, max=30),
+       stop=stop_after_attempt(3), reraise=True)
+def _generate_structured_once(prompt: str, schema: type[T], system: str | None,
+                              model: str, temperature: float) -> T:
+    gemini = client()  # hold a reference for the whole call
+    resp = gemini.models.generate_content(
+        model=model,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system,
@@ -83,8 +143,9 @@ def chat_model(provider: str = "gemini", temperature: float = 0.0, model: str | 
     if provider == "claude":
         from langchain_anthropic import ChatAnthropic
 
+        # No temperature: current Claude models reject it ("temperature is deprecated")
         return ChatAnthropic(model=settings.claude_model, api_key=settings.anthropic_api_key,
-                             temperature=temperature, max_retries=3, max_tokens=4096)
+                             max_retries=3, max_tokens=4096)
     raise ValueError(f"unknown provider {provider!r}")
 
 

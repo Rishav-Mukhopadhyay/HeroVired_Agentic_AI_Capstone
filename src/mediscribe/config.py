@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     gemini_embed_model: str = "gemini-embedding-001"
     anthropic_api_key: str = ""
     claude_model: str = "claude-haiku-5-5"
+    # Last resort when every Gemini model fails (uses the small Anthropic credit)
+    claude_fallback: bool = True
 
     # Monitoring
     langfuse_public_key: str = ""

@@ -7,8 +7,11 @@ available to every agent with no agent code change; removing a server removes it
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
+from typing import Any
 
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -43,3 +46,33 @@ async def discover_tools(servers: list[str] | None = None, read_only: bool = Fal
         tools = await client.get_tools(server_name=name)
         found[name] = [t for t in tools if is_read_only(t)] if read_only else tools
     return found
+
+
+# ---------- Calling a tool from workflow code (no LLM involved) ----------
+
+class ToolCallError(RuntimeError):
+    pass
+
+
+async def acall_tool(server: str, tool: str, args: dict[str, Any]) -> Any:
+    """Call one MCP tool and return its result as plain Python data."""
+    async with mcp_client([server]).session(server) as session:
+        result = await session.call_tool(tool, args)
+    if result.isError:
+        raise ToolCallError(f"{server}.{tool} failed: {result.content}")
+    data = result.structuredContent
+    if data is not None:
+        # FastMCP wraps non-dict return values as {"result": value}
+        return data["result"] if set(data) == {"result"} else data
+    texts = [c.text for c in result.content if getattr(c, "type", "") == "text"]
+    parsed = [json.loads(t) for t in texts]
+    return parsed[0] if len(parsed) == 1 else parsed
+
+
+def call_tool(server: str, tool: str, args: dict[str, Any]) -> Any:
+    """Synchronous wrapper used by the LangGraph workflow nodes.
+
+    The workflow runs synchronously (the Postgres checkpointer's async driver cannot share
+    Windows' event loop with MCP's subprocess transport), so each tool call gets its own loop.
+    """
+    return asyncio.run(acall_tool(server, tool, args))
