@@ -66,6 +66,17 @@ def safe_run(graph, payload, config, thread_id: str) -> dict | None:
         return None
 
 
+def dosage(*parts: str) -> str:
+    """Join dose parts, skipping blanks, placeholders and repeats ('single dose single dose')."""
+    out: list[str] = []
+    for part in parts:
+        part = (part or "").strip()
+        if part and part.lower() not in ("not specified", "n/a", "unspecified") and part.lower() not in \
+                [o.lower() for o in out] and not any(part.lower() in o.lower() for o in out):
+            out.append(part)
+    return " ".join(out) or "dose per prescriber"
+
+
 def show_packet(p: dict) -> None:
     pt = p["patient"]
     console.print(Panel(f"{pt['name']} · {pt['gender']} · born {pt['birthDate']}\n"
@@ -73,16 +84,19 @@ def show_packet(p: dict) -> None:
                         f"Medications: {', '.join(pt['medications']) or '-'}\n"
                         f"[bold]Allergies: {', '.join(pt['allergies']) or 'none'}[/bold]",
                         title=f"Physician review · encounter {p['encounter_id']}"))
+    if p.get("memory"):
+        console.print(Panel("\n".join(f"{m['date']}: {m['summary']}" for m in p["memory"]),
+                            title="Previous visits (patient memory)", style="cyan"))
     if p["red_flags"]:
         console.print(Panel("\n".join(p["red_flags"]), title="RED FLAGS", style="bold red"))
     console.print(Panel(p["note_text"], title="Draft clinical note (SOAP)"))
 
     dx_table = Table(title="Suggested diagnoses")
-    for col in ("#", "Diagnosis", "ICD-10-CM", "Confidence", "Reasoning"):
+    for col in ("#", "Diagnosis", "ICD-10-CM", "Confidence", "Reasoning", "Guideline"):
         dx_table.add_column(col, overflow="fold")
     for i, d in enumerate(p["diagnoses"]):
         dx_table.add_row(str(i), d["diagnosis"], f"{d.get('icd10_code') or '?'} {d.get('icd10_name') or ''}",
-                         d["confidence"], d["reasoning"])
+                         d["confidence"], d["reasoning"], "\n".join(d.get("guideline_refs", [])) or "-")
     console.print(dx_table)
     if p["differentials"]:
         console.print(f"[dim]Differentials to consider: {', '.join(p['differentials'])}[/dim]")
@@ -91,11 +105,27 @@ def show_packet(p: dict) -> None:
     for col in ("#", "Medication", "Dosage", "Safety", "Findings"):
         rx_table.add_column(col, overflow="fold")
     for i, rx in enumerate(p["prescriptions"]):
-        dosage = " ".join(x for x in (rx["dose"], rx["route"], rx["frequency"], rx["duration"]) if x)
         style = STATUS_STYLE[rx["safety_status"]]
-        rx_table.add_row(str(i), rx["medication"], dosage, f"[{style}]{rx['safety_status'].upper()}[/{style}]",
+        rx_table.add_row(str(i), rx["medication"], dosage(rx["dose"], rx["route"], rx["frequency"], rx["duration"]), f"[{style}]{rx['safety_status'].upper()}[/{style}]",
                          "\n".join(rx["safety_notes"]) or "-")
     console.print(rx_table if p["prescriptions"] else "[dim]No new prescriptions.[/dim]")
+
+    for rx in p["prescriptions"]:
+        if rx.get("alternatives"):
+            alt = Table(title=f"Guideline alternatives to {rx['medication']} (safety-checked)")
+            for col in ("Medication", "Dosage", "Safety", "Why", "Guideline"):
+                alt.add_column(col, overflow="fold")
+            for a in rx["alternatives"]:
+                style = STATUS_STYLE[a["safety_status"]]
+                alt.add_row(a["medication"], dosage(a["dose"], a["frequency"], a["duration"]),
+                            f"[{style}]{a['safety_status'].upper()}[/{style}]", a["rationale"], a["guideline_ref"])
+            console.print(alt)
+
+    cited = {r for d in p["diagnoses"] for r in d.get("guideline_refs", [])} | \
+            {a["guideline_ref"] for rx in p["prescriptions"] for a in rx.get("alternatives", [])}
+    if cited:
+        console.print("[dim]Sources: " + "; ".join(
+            f"{r} = {p['guidelines'][r]['source']}" for r in sorted(cited) if r in p.get("guidelines", {})) + "[/dim]")
 
 
 def ask_decision(p: dict, thread_id: str) -> dict | None:

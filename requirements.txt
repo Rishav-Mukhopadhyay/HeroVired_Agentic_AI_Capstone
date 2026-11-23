@@ -26,6 +26,9 @@ datasets>=3.0
 pandas>=2.2
 requests>=2.32
 
+# Vector database (guideline RAG + patient memory), local embeddings
+chromadb>=1.0
+
 # Databases
 sqlalchemy>=2.0
 psycopg[binary]>=3.2

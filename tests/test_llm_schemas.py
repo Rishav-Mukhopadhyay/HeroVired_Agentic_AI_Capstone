@@ -6,10 +6,12 @@ dict fields (JSON-schema "additionalProperties"), which the Developer API reject
 
 import pytest
 
-from mediscribe.schemas import DiagnosisSuggestions, PrescriptionDrafts, SOAPNote, WorkflowPlan
+from mediscribe.schemas import (AlternativeSuggestions, DiagnosisSuggestions, PrescriptionDrafts,
+                                SOAPNote, WorkflowPlan)
 from mediscribe.transcription import SpeakerLabels
 
-LLM_SCHEMAS = [SOAPNote, WorkflowPlan, DiagnosisSuggestions, PrescriptionDrafts, SpeakerLabels]
+LLM_SCHEMAS = [SOAPNote, WorkflowPlan, DiagnosisSuggestions, PrescriptionDrafts, AlternativeSuggestions,
+               SpeakerLabels]
 
 
 def _walk(node):

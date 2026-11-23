@@ -9,10 +9,14 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from mediscribe import workflow
-from mediscribe.schemas import (DiagnosisDraft, DiagnosisSuggestions, PrescriptionDrafts,
-                                PrescriptionItem, ProblemAssessment, SOAPNote, WorkflowPlan)
+from mediscribe.schemas import (AlternativeOption, AlternativeSuggestions, DiagnosisDraft,
+                                DiagnosisSuggestions, PrescriptionDrafts, PrescriptionItem,
+                                ProblemAssessment, SOAPNote, WorkflowPlan)
 from mediscribe.tools.drugs import check_allergy
 
+GUIDELINE_HITS = [{"id": "uti_cystitis#first-line-treatment", "text": "Nitrofurantoin 100 mg twice daily 5 days...",
+                   "title": "Acute uncomplicated cystitis", "section": "First-line treatment",
+                   "source": "IDSA 2010", "file": "uti_cystitis.md", "distance": 0.3}]
 PATIENT = {"id": "1000", "name": "Martha Collins", "gender": "female", "birthDate": "1976-11-01",
            "conditions": ["hypertension"], "medications": ["lisinopril 10 mg oral once daily"],
            "allergies": ["sulfonamide antibiotics"]}
@@ -25,7 +29,19 @@ def fake_structured(plan: WorkflowPlan):
         if schema is DiagnosisSuggestions:
             return DiagnosisSuggestions(diagnoses=[DiagnosisDraft(
                 diagnosis="Acute cystitis", icd10_search_term="acute cystitis", confidence="high",
-                reasoning="Dysuria and frequency", supporting_evidence=["burning on urination"])])
+                reasoning="Dysuria and frequency", supporting_evidence=["burning on urination"],
+                guideline_refs=["uti_cystitis#first-line-treatment", "made_up#ref"])])
+        if schema is AlternativeSuggestions:
+            return AlternativeSuggestions(alternatives=[
+                AlternativeOption(medication="nitrofurantoin", dose="100 mg", frequency="twice daily",
+                                  duration="5 days", rationale="First-line, no sulfonamide",
+                                  guideline_ref="uti_cystitis#first-line-treatment"),
+                AlternativeOption(medication="sulfadiazine", dose="1 g", frequency="daily",
+                                  rationale="same class: must be filtered by the allergy check",
+                                  guideline_ref="uti_cystitis#first-line-treatment"),
+                AlternativeOption(medication="ciprofloxacin", dose="250 mg", frequency="twice daily",
+                                  rationale="not in the excerpts: must be dropped",
+                                  guideline_ref="invented#ref")])
         if schema is PrescriptionDrafts:
             return PrescriptionDrafts(prescriptions=[
                 PrescriptionItem(medication="Bactrim DS", dose="800/160 mg", frequency="twice daily",
@@ -64,7 +80,14 @@ def graph(monkeypatch):
         assessment_and_plan=[ProblemAssessment(problem="UTI", assessment="Likely cystitis",
                                                plan=["Bactrim DS twice daily for 3 days"])]))
     monkeypatch.setattr(workflow, "call_tool", fake_tool(writes))
+    memory_store: list = []
+    monkeypatch.setattr(workflow, "retrieve_guidelines", lambda query, k=4: GUIDELINE_HITS)
+    monkeypatch.setattr(workflow, "recall_visits", lambda pid, query, k=3: [
+        {"date": m["date"], "summary": m["summary"]} for m in memory_store if m["pid"] == pid])
+    monkeypatch.setattr(workflow, "remember_visit", lambda pid, enc, summary, **kw: memory_store.append(
+        {"pid": pid, "date": "2026-11-23", "summary": summary}))
     g = workflow.build_graph(checkpointer=InMemorySaver())
+    g.memory_store = memory_store  # exposed for assertions
     return g, writes, plan
 
 
@@ -169,3 +192,31 @@ def test_diagnosis_already_on_record_is_not_duplicated(graph, monkeypatch):
     written = [a["diagnosis"] for t, a in writes if t == "add_diagnosis"]
     assert written == ["Acute cystitis"]
     assert final["audit"][-1]["already_on_record"] == ["Hypertension"]
+
+
+def test_diagnoses_cite_only_retrieved_guidelines(graph):
+    g, _, _ = graph
+    _, result = start(g, "rag")
+    packet = result["__interrupt__"][0].value
+    assert packet["diagnoses"][0]["guideline_refs"] == ["uti_cystitis#first-line-treatment"]  # invented ref removed
+    assert "uti_cystitis#first-line-treatment" in packet["guidelines"]
+
+
+def test_blocked_prescription_gets_safety_checked_guideline_alternatives(graph):
+    g, _, _ = graph
+    _, result = start(g, "alt")
+    bactrim = result["__interrupt__"][0].value["prescriptions"][0]
+    assert bactrim["safety_status"] == "blocked"
+    names = [a["medication"] for a in bactrim["alternatives"]]
+    assert names == ["nitrofurantoin"]  # sulfadiazine fails the allergy check; ciprofloxacin is ungrounded
+
+
+def test_approved_visit_is_remembered_and_recalled_next_time(graph):
+    g, _, _ = graph
+    config, _ = start(g, "visit1")
+    g.invoke(Command(resume={"decision": "approve"}), config)
+    assert "Not prescribed (blocked): Bactrim DS" in g.memory_store[0]["summary"]
+
+    _, result = start(g, "visit2")
+    memory = result["__interrupt__"][0].value["memory"]
+    assert len(memory) == 1 and "Acute cystitis" in memory[0]["summary"]

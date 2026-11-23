@@ -113,6 +113,10 @@ class DiagnosisDraft(BaseModel):
     confidence: Literal["high", "medium", "low"]
     reasoning: str = Field(description="Why this diagnosis fits, in one or two sentences")
     supporting_evidence: list[str] = Field(description="Facts from the note that support it")
+    guideline_refs: list[str] = Field(
+        default_factory=list,
+        description="Ids of the guideline excerpts that support this, exactly as given in "
+                    "square brackets, e.g. 'uti_cystitis#diagnosis'. Empty if none apply.")
 
 
 class DiagnosisSuggestion(DiagnosisDraft):
@@ -151,6 +155,23 @@ class PrescriptionDraft(PrescriptionItem):
     safety_notes: list[str] = Field(default_factory=list)
     allergy_check: dict | None = None
     interaction_check: dict | None = None
+    alternatives: list[dict] = Field(default_factory=list)  # safety-checked AlternativeOptions
+
+
+class AlternativeOption(BaseModel):
+    """A guideline-supported substitute for a prescription the safety check blocked."""
+
+    medication: str
+    dose: str
+    frequency: str
+    duration: str = ""
+    rationale: str = Field(description="Why this fits the patient, in one sentence")
+    guideline_ref: str = Field(description="Id of the guideline excerpt that recommends it")
+
+
+class AlternativeSuggestions(BaseModel):
+    alternatives: list[AlternativeOption] = Field(
+        description="Up to 3 options taken from the guideline excerpts. Empty if none apply.")
 
 
 class PrescriptionDrafts(BaseModel):

@@ -13,6 +13,10 @@ Design choices
 - Only ehr_writer uses the EHR write tools, and only after an approval. Blocked prescriptions
   are not written unless the physician gives an override reason.
 - State holds plain dicts (model_dump()) so checkpoints are plain JSON-like data.
+- RAG: the diagnostician reads retrieved guideline excerpts and cites them; when a prescription
+  is blocked, the pharmacist retrieves guideline alternatives and safety-checks them too.
+- Memory: past approved visits of the patient are recalled at the start and the approved visit
+  is remembered at the end (ChromaDB).
 """
 
 from __future__ import annotations
@@ -28,11 +32,22 @@ from langgraph.types import RetryPolicy, interrupt
 
 from mediscribe.agents.scribe import generate_note
 from mediscribe.config import settings
+from mediscribe.knowledge import format_excerpts, recall_visits, remember_visit, retrieve_guidelines
 from mediscribe.llm import generate_structured, last_model_used
 from mediscribe.mcp_client import ToolCallError, call_tool
 from mediscribe.prompts import load_prompt
-from mediscribe.schemas import (DiagnosisSuggestion, DiagnosisSuggestions, PhysicianDecision,
-                                PrescriptionDraft, PrescriptionDrafts, SOAPNote, WorkflowPlan)
+from mediscribe.schemas import (AlternativeSuggestions, DiagnosisSuggestion, DiagnosisSuggestions,
+                                PhysicianDecision, PrescriptionDraft, PrescriptionDrafts, SOAPNote,
+                                WorkflowPlan)
+
+DIAGNOSTICIAN_PROMPT = "v2"  # v1 = no guidelines or memory; v2 = RAG + patient memory
+
+
+def merge_by_id(existing: list[dict] | None, new: list[dict] | None) -> list[dict]:
+    """Reducer for keys written by parallel nodes: union of both lists, de-duplicated by id."""
+    existing, new = existing or [], new or []
+    seen = {h["id"] for h in existing}
+    return existing + [h for h in new if h["id"] not in seen and not seen.add(h["id"])]
 
 
 class ConsultationState(TypedDict, total=False):
@@ -40,6 +55,9 @@ class ConsultationState(TypedDict, total=False):
     transcript: str
     patient_id: str
     patient: dict
+    memory: list[dict]           # this patient's previous visits (long-term memory)
+    # guideline excerpts retrieved for this visit (RAG); written by two parallel agents, so merged
+    guidelines: Annotated[list[dict], merge_by_id]
     plan: dict
     note: dict
     diagnoses: list[dict]
@@ -65,8 +83,13 @@ def load_patient(state: ConsultationState) -> dict:
     if "patient_id" not in found:
         raise ValueError(found.get("error", "patient not found"))
     patient = call_tool("ehr", "get_patient_summary", {"patient_id": found["patient_id"]})
-    return {"patient_id": found["patient_id"], "patient": patient, "status": "in_progress",
-            "audit": log("load_patient", "patient loaded", patient_id=found["patient_id"])}
+    try:
+        memory = recall_visits(found["patient_id"], state["transcript"][:2000])
+    except Exception:  # noqa: BLE001 - memory is helpful, not essential
+        memory = []
+    return {"patient_id": found["patient_id"], "patient": patient, "memory": memory, "status": "in_progress",
+            "audit": log("load_patient", "patient loaded", patient_id=found["patient_id"],
+                         previous_visits=len(memory))}
 
 
 def planner(state: ConsultationState) -> dict:
@@ -93,9 +116,18 @@ def patient_context(patient: dict) -> str:
 def diagnostician(state: ConsultationState) -> dict:
     """Suggest diagnoses (LLM), then attach official ICD-10-CM codes (terminology MCP tool)."""
     note = SOAPNote.model_validate(state["note"])
+    query = " ".join([note.chief_complaint] + [f"{p.problem} {p.assessment}" for p in note.assessment_and_plan])
+    hits = _safe_retrieve(query, k=5)
+    previous = "\n".join(f"- {m['date']}: {m['summary']}" for m in state.get("memory", [])) or "(none)"
     result = generate_structured(
-        f"### PATIENT RECORD\n{patient_context(state['patient'])}\n\n### CLINICAL NOTE\n{note.to_text()}",
-        DiagnosisSuggestions, system=load_prompt("diagnostician", "v1"))
+        f"### PATIENT RECORD\n{patient_context(state['patient'])}\n\n"
+        f"### PREVIOUS VISITS\n{previous}\n\n"
+        f"### GUIDELINE EXCERPTS\n{format_excerpts(hits)}\n\n"
+        f"### CLINICAL NOTE\n{note.to_text()}",
+        DiagnosisSuggestions, system=load_prompt("diagnostician", DIAGNOSTICIAN_PROMPT))
+    known = {h["id"] for h in hits}
+    for d in result.diagnoses:  # keep only citations of excerpts we actually provided
+        d.guideline_refs = [r for r in d.guideline_refs if r in known]
 
     diagnoses = [DiagnosisSuggestion(**d.model_dump()) for d in result.diagnoses]
     for dx in diagnoses:
@@ -110,6 +142,7 @@ def diagnostician(state: ConsultationState) -> dict:
                 break
     return {"diagnoses": [d.model_dump() for d in diagnoses],
             "differentials": result.differentials_to_consider,
+            "guidelines": hits,
             "audit": log("diagnostician", "diagnoses suggested", model=last_model_used(),
                          codes=[d.icd10_code for d in diagnoses])}
 
@@ -121,11 +154,49 @@ def pharmacist(state: ConsultationState) -> dict:
                                 system=load_prompt("pharmacist", "v1")).prescriptions
     drafts = [PrescriptionDraft(**item.model_dump()) for item in items]
     patient = state["patient"]
+    used_hits: list[dict] = []
     for rx in drafts:
         rx_checks(rx, patient.get("allergies", []), patient.get("medications", []))
+        if rx.safety_status == "blocked":
+            used_hits += suggest_alternatives(rx, patient)
     return {"prescriptions": [rx.model_dump() for rx in drafts],
+            "guidelines": used_hits,
             "audit": log("pharmacist", "prescriptions drafted and checked", model=last_model_used(),
-                         statuses={rx.medication: rx.safety_status for rx in drafts})}
+                         statuses={rx.medication: rx.safety_status for rx in drafts},
+                         alternatives={rx.medication: [a["medication"] for a in rx.alternatives]
+                                       for rx in drafts if rx.alternatives})}
+
+
+def suggest_alternatives(rx: PrescriptionDraft, patient: dict) -> list[dict]:
+    """RAG for a blocked prescription: retrieve guideline options for the same indication, let the
+    LLM pick ones that avoid the problem, then run the SAME safety checks on each option."""
+    hits = _safe_retrieve(f"{rx.indication} treatment first-line alternatives to {rx.medication}", k=4)
+    if not hits:
+        return []
+    result = generate_structured(
+        f"### BLOCKED PRESCRIPTION\n{rx.medication} {rx.dosage_text()} for {rx.indication}\n"
+        f"Blocked because: {'; '.join(rx.safety_notes[:2])}\n\n"
+        f"### PATIENT RECORD\n{patient_context(patient)}\n\n### GUIDELINE EXCERPTS\n{format_excerpts(hits)}",
+        AlternativeSuggestions, system=load_prompt("pharmacist_alternatives", "v1"))
+    known = {h["id"] for h in hits}
+    for option in result.alternatives:
+        if option.guideline_ref not in known:  # not grounded in what we retrieved: drop it
+            continue
+        checked = PrescriptionDraft(medication=option.medication, dose=option.dose, frequency=option.frequency,
+                                    duration=option.duration, indication=rx.indication)
+        rx_checks(checked, patient.get("allergies", []), patient.get("medications", []))
+        if checked.safety_status != "blocked":
+            rx.alternatives.append({**option.model_dump(), "safety_status": checked.safety_status,
+                                    "safety_notes": checked.safety_notes})
+    return hits
+
+
+def _safe_retrieve(query: str, k: int) -> list[dict]:
+    try:
+        return retrieve_guidelines(query, k=k)
+    except Exception:  # noqa: BLE001 - no guidelines is better than no workflow
+        return []
+
 
 
 def rx_checks(rx: PrescriptionDraft, allergies: list[str], medications: list[str]) -> None:
@@ -163,6 +234,8 @@ def review_packet(state: ConsultationState) -> dict:
     return {
         "encounter_id": state["encounter_id"],
         "patient": state["patient"],
+        "memory": state.get("memory", []),
+        "guidelines": {h["id"]: h for h in state.get("guidelines", [])},
         "red_flags": state.get("plan", {}).get("red_flags", []),
         "note_text": SOAPNote.model_validate(state["note"]).to_text(),
         "diagnoses": state.get("diagnoses", []),
@@ -236,9 +309,22 @@ def ehr_writer(state: ConsultationState) -> dict:
                                 {"patient_id": pid, "medication": rx.medication,
                                  "dosage": rx.dosage_text(), "note": note}))
 
+    note = SOAPNote.model_validate(state["note"])
+    approved_rx = [prescriptions[i]["medication"] for i in decision.approved_prescriptions or []]
+    summary = (f"Complaint: {note.chief_complaint}. "
+               f"Diagnoses: {', '.join(d['diagnosis'] + (' (' + d['icd10_code'] + ')' if d.get('icd10_code') else '') for d in diagnoses) or 'none'}. "
+               f"Prescribed: {', '.join(approved_rx) or 'nothing new'}. "
+               + (f"Not prescribed (blocked): {', '.join(rx['medication'] + ' - ' + '; '.join(rx['safety_notes'][:1]) for rx in excluded)}. " if excluded else "")
+               + (f"Physician comments: {decision.comments}" if decision.comments else ""))
+    try:
+        remember_visit(pid, state["encounter_id"], summary)
+        remembered = True
+    except Exception:  # noqa: BLE001
+        remembered = False
+
     return {"ehr_writes": writes, "status": "written_to_ehr",
             "audit": log("ehr_writer", "written to EHR", resources=[f"{w['resourceType']}/{w['id']}" for w in writes],
-                         already_on_record=skipped)}
+                         already_on_record=skipped, remembered=remembered)}
 
 
 # ---------------------------------------------------------------- routing
