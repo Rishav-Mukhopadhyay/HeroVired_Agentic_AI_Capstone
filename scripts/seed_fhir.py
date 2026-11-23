@@ -125,6 +125,8 @@ def main():
     args = ap.parse_args()
     splits = [args.split] if args.split else list(ACI_SPLITS)
 
+    fhir.wait_until_ready()
+
     counts = {"created": 0, "exists": 0}
     for split in splits:
         for _, row in load_aci(split).iterrows():

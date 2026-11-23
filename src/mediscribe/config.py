@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     # LLMs
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash"
+    # Tried in order when the main model is overloaded (503) or rate limited (429)
+    gemini_fallback_models: str = "gemini-3.5-flash-lite,gemini-3.1-flash-lite"
     gemini_embed_model: str = "gemini-embedding-001"
     anthropic_api_key: str = ""
     claude_model: str = "claude-haiku-5-5"
